@@ -228,4 +228,4 @@ The automated suite exercises these failure paths without real credentials. Live
 
 ## License
 
-No license has been selected.
+This project is licensed under the [MIT License](LICENSE).
