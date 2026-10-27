@@ -1,231 +1,231 @@
-# My AI Assistant
+# My AI Assistant — v0.2
 
-A small, self-hosted personal AI agent built in Python. The goal is to learn how an agent works from the ground up while keeping **all AI inference on hardware I control**.
+A small personal assistant and software-engineering learning project. Model inference runs locally through Ollama; Telegram carries messages and Open-Meteo supplies today's Kanata, Ottawa forecast. No agent framework or cloud model fallback.
 
-The first version (v0.1) accepts messages through a private Telegram bot, uses a local model to decide when a tool is needed, fetches today's weather forecast for Kanata (Ottawa), and replies in natural language. It does not use OpenClaw, LangChain, cloud LLMs, or a web UI.
-
-> **Privacy boundary:** *Local inference* does not mean *offline*. Model inference runs on the local machine. Telegram carries chat messages through its servers, and [Open-Meteo](https://open-meteo.com/en/docs) receives the configured weather coordinates when a forecast is requested. No chat messages are sent to a hosted AI model.
-
-## Current capabilities
-
-- Chat through a Telegram bot, without opening inbound ports on the home router (Telegram long polling).
-- Restrict normal chat requests to one configured Telegram user ID.
-- Run [Qwen3.5 4B](https://ollama.com/library/qwen3.5:4b) locally with [Ollama](https://ollama.com/).
-- Allow the model to choose the narrowly defined `get_weather` tool.
-- Retrieve a forecast for Kanata using the Open-Meteo API.
-- Generate a concise, natural-language answer using the local model.
-
-**Not implemented yet:** conversation history across messages, persistent memory, scheduled notifications, configurable locations, iMessage integration, background service management, and a comprehensive test suite.
+Implemented: private-chat authorization, Telegram long polling, local tool calling, a validated weather tool, per-user rate limiting, bounded input/polling, safe errors, JSON console logs, and offline tests. Each request is handled independently, without conversation memory.
 
 ## Architecture
 
-```text
-Telegram app
-    |
-    | Telegram Bot API (outbound long polling)
-    v
-assistant.py  [runs on my Mac]
-    |-- Verify sender / route messages
-    |-- Agent loop: prompt -> model -> optional tool -> model -> reply
-    |       |
-    |       +-- Ollama (localhost:11434) -> Qwen3.5 4B
-    |       |
-    |       +-- get_weather() -> Open-Meteo HTTPS API
-    |
-    +-- Send response through Telegram
+```mermaid
+flowchart LR
+    T[Telegram long polling] --> C[Channel: authorize and validate]
+    C --> A[Agent]
+    A --> O[Ollama on loopback]
+    A --> R[Tool registry]
+    R --> W[Open-Meteo weather]
+    A --> C
 ```
 
-The Python application controls which tools may execute. The model can *request* `get_weather`, but it cannot execute arbitrary shell commands, read arbitrary files, or call arbitrary external services through the tool registry.
+`assistant.py` starts `personal_assistant/app.py`. Configuration, HTTP transport, model client, orchestration, channel, security, and tools are separate modules. See [architecture](docs/architecture.md) for interfaces and trade-offs.
 
-## Requirements
+## First-time setup
 
-- A Mac with Apple Silicon (initially developed for a **2022 M2 MacBook Air with 16 GB RAM**). A Linux machine may be supported later.
-- Python **3.11 or later**.
-- [Ollama for macOS](https://ollama.com/download/mac).
-- Internet access for Telegram and live weather forecasts.
-- A Telegram account and a bot created through [@BotFather](https://t.me/BotFather).
+These setup instructions cover macOS with Python 3.11+ and Ollama running Qwen3.5 4B. `python-dotenv` is the only third-party runtime dependency.
 
-## Setup
+### 1. Prepare Python
 
-### 1. Clone the project and create a Python environment
-
-If you already have the project locally, open its directory instead of cloning:
+Open a terminal in your checkout (replace the example path below):
 
 ```bash
-cd ~/my-assistant
-python3 --version        # Python 3.11+
+cd /path/to/my-assistant
+python3 --version
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
-For the current implementation, `requirements.txt` contains:
+### 2. Install and configure Ollama
 
-```text
-python-dotenv
-```
-
-### 2. Install Ollama and download the model
-
-Install Ollama and open the app, then run:
+Install [Ollama for macOS](https://ollama.com/download/mac), open it, and download the model:
 
 ```bash
 ollama pull qwen3.5:4b
 ollama run qwen3.5:4b
 ```
 
-Try a question, then enter `/bye` to exit the model's interactive chat. Ollama itself should remain running in the background while the assistant is running.
+Enter `/bye` to leave the interactive model session. Keep Ollama running on its loopback listener, never `0.0.0.0` or a LAN interface.
 
-To confirm the local API is available:
+Disable Ollama cloud features by merging `"disable_ollama_cloud": true` into `~/.ollama/server.json`, preserving existing settings, and restart Ollama. Alternatively set `OLLAMA_NO_CLOUD=1` in the environment of the **Ollama server**, not just this assistant. See the [official Ollama FAQ](https://docs.ollama.com/faq). Use an installed local model; a localhost URL by itself does not prevent Ollama from forwarding requests to a cloud model.
 
 ```bash
 curl http://127.0.0.1:11434/api/tags
 ```
 
-### 3. Explicitly disable Ollama cloud features
+### 3. Create a Telegram bot and obtain your user ID
 
-Create or edit `~/.ollama/server.json` (preserve any settings already in the file) so it includes:
+Create a Telegram bot with [BotFather](https://t.me/BotFather): send `/newbot`, follow the prompts, and privately save the token. Send the new bot a private message.
 
-```json
-{
-  "disable_ollama_cloud": true
-}
+To retrieve your user ID, stop any bot process first, then use the following local snippet. It asks for the token without echoing it, calls the [Telegram Bot API](https://core.telegram.org/bots/api#getupdates), and prints only IDs from private messages. Keep the output private. If multiple IDs appear, identify your own before configuring access. A webhook must not be configured for long polling to work.
+
+```bash
+python - <<'PY'
+import getpass
+import json
+import urllib.request
+
+token = getpass.getpass("Bot token: ")
+try:
+    request = urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/getUpdates",
+        data=json.dumps({"timeout": 0, "limit": 100, "allowed_updates": ["message"]}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        result = json.load(response)
+    ids = {u["message"]["from"]["id"] for u in result.get("result", [])
+           if u.get("message", {}).get("chat", {}).get("type") == "private"}
+    print(sorted(ids) if ids else "Send a fresh private message to your bot, then retry.")
+except Exception:
+    print("ID lookup failed. Check the token, network, certificates and webhook settings.")
+PY
 ```
 
-Restart Ollama afterward. This prevents the Ollama runtime from using its optional cloud model and web-search features. See the [official Ollama FAQ](https://github.com/ollama/ollama/blob/main/docs/faq.mdx#how-do-i-disable-ollama-cloud-features).
+### 4. Configure the assistant
 
-The assistant is configured to call the Ollama API at `127.0.0.1`, not a remote endpoint.
-
-### 4. Create a Telegram bot
-
-1. Open [@BotFather](https://t.me/BotFather) in Telegram.
-2. Send `/newbot` and follow the prompts.
-3. Copy the bot token. Treat it as a password; anyone with it can control your bot.
-4. Open a **private chat** with your new bot and send `/start`.
-
-You also need your **numeric Telegram user ID**, not your username. See the bootstrap instructions below.
-
-### 5. Set up local configuration and secrets
-
-Copy the safe template into a private local file:
+For a **new checkout only**, copy `.env.example` to `.env` and restrict its permissions:
 
 ```bash
 cp .env.example .env
 chmod 600 .env
 ```
 
-Edit `.env` with your own values:
+If `.env` already exists, preserve it. Edit it yourself using `.env.example` as the reference. Required values are `TELEGRAM_BOT_TOKEN` and a positive `TELEGRAM_ALLOWED_USER_ID`. Existing v0.1 configuration remains compatible; omitted new settings use defaults. Exported environment variables take precedence over `.env`.
 
-```dotenv
-# Telegram
-TELEGRAM_BOT_TOKEN=replace_with_your_bot_token
-TELEGRAM_ALLOWED_USER_ID=123456789
+| Setting | Default | Meaning |
+|---|---|---|
+| `OLLAMA_URL` | `http://127.0.0.1:11434/api/chat` | Loopback HTTP endpoint only |
+| `OLLAMA_MODEL` | `qwen3.5:4b` | Installed local model |
+| `TIMEZONE` | `America/Toronto` | Forecast and prompt timezone |
+| `RATE_LIMIT` | 10 | Requests per user in a sliding 60-second window |
+| `MAX_MESSAGE_LENGTH` | 2000 | Reject longer text; maximum 4096 |
+| `MAX_TOOL_CALLS` | 2 | Maximum batch; larger batches execute nothing |
+| `POLL_LIMIT` | 10 | Maximum updates per fetch; maximum 100 |
+| `MAX_MESSAGE_AGE` | 300 | Ignore messages older than this at batch arrival, seconds |
+| `CONNECT_TIMEOUT` | 10 | Connection timeout, seconds |
+| `INFERENCE_TIMEOUT` | 180 | Model socket timeout, seconds |
+| `EXTERNAL_TIMEOUT` | 45 | Telegram/weather socket timeout; must exceed 25 seconds |
+| `REQUEST_BUDGET` | 400 | Budget checked between agent operations, seconds |
 
-# Local AI
-OLLAMA_URL=http://127.0.0.1:11434/api/chat
-OLLAMA_MODEL=qwen3.5:4b
+### 5. Test and launch
 
-# Assistant
-TIMEZONE=America/Toronto
-```
+Run `python -m unittest discover -v` from the repository root. If it ends with `OK`, follow the launch steps below, then send `/start` and a weather question to your bot.
 
-**How to discover your Telegram user ID with the current v0.1 code:** the assistant requires a nonzero `TELEGRAM_ALLOWED_USER_ID` to start, but its `/id` command is available before the allowlist check. For the **first run only**, use `TELEGRAM_ALLOWED_USER_ID=1` as a temporary placeholder, start the assistant, and send `/id` in the private bot chat. It will reply with *your* numeric ID. Stop the program, replace `1` in `.env` with your actual ID, and restart. Other users cannot execute normal agent requests without matching the configured ID. (A future version should implement a cleaner setup command.)
+## Subsequent launches (including after a restart)
 
-**Do not commit `.env`.** It should be excluded in `.gitignore`; `.env.example` should be safe to commit because it contains placeholders only.
+You do not need to recreate the virtual environment, copy `.env`, or download the model each time.
 
-Note: `python-dotenv` does not overwrite variables already exported in your shell by default. If you previously used `export TELEGRAM_ALLOWED_USER_ID=...`, run `unset TELEGRAM_ALLOWED_USER_ID` so `.env` takes effect.
+### 1. Start Ollama
 
-### 6. Run the assistant
-
-In a terminal:
+Open **Ollama** from Applications or Spotlight. Alternatively, from Terminal:
 
 ```bash
-cd ~/my-assistant
+open -a Ollama
+```
+
+Wait a few seconds, then check the local server:
+
+```bash
+curl --fail --max-time 10 http://127.0.0.1:11434/api/tags
+```
+
+You should see JSON listing installed models, including `qwen3.5:4b`. If the connection is refused, wait and retry; check that the Ollama application is running. The persistent `disable_ollama_cloud` setting from first-time setup continues to apply after restarting. See the [Ollama FAQ](https://docs.ollama.com/faq) for server settings.
+
+You do **not** need an interactive `ollama run` session for the assistant. Its first request loads the installed model as needed, so the first response may be slower.
+
+If you prefer running the server directly in a terminal, quit the Ollama application first, then run:
+
+```bash
+OLLAMA_NO_CLOUD=1 OLLAMA_HOST=127.0.0.1:11434 ollama serve
+```
+
+Keep that terminal open and use a second terminal for the assistant. Choose either the application or the terminal server; running both causes a port conflict.
+
+### 2. Start the assistant
+
+In a terminal, replace the example path with your checkout location:
+
+```bash
+cd /path/to/my-assistant
 source .venv/bin/activate
 python assistant.py
 ```
 
-You should see:
+Look for the `assistant_started` JSON event, then send a fresh private message to the bot. This event confirms the polling loop started; subsequent error events indicate connection or configuration problems. Run only one assistant process, and keep the Mac awake and connected.
 
-```text
-Assistant is running. Press Ctrl+C to stop.
-```
+### 3. Stop it
 
-Message your Telegram bot:
+Press **Ctrl+C** in the assistant terminal. Optionally run `deactivate` to leave the virtual environment. Stopping the assistant does not stop Ollama: quit its application separately, or press Ctrl+C in the terminal running `ollama serve`.
 
-> What's the weather like today? Should I bring an umbrella?
+After a reboot, repeat steps 1 and 2. This project does not install an automatic background service.
 
-The bot should retrieve the weather and respond using the local model. Stop it with **Ctrl+C**.
+## Unit tests (offline)
 
-The Mac must remain awake and connected while the bot is running. The initial prototype is not installed as an automatic background service.
-
-## Project files
-
-```text
-my-assistant/
-├── assistant.py       # Telegram polling, local LLM agent loop, weather tool
-├── requirements.txt   # Python dependencies
-├── .env.example       # Safe configuration template (committed)
-├── .env               # Actual secrets/configuration (NEVER committed)
-├── .gitignore         # Git exclusions
-└── README.md          # Project overview and instructions
-```
-
-## Security and privacy
-
-- **Local model:** The assistant sends AI prompts to Ollama at `http://127.0.0.1:11434/api/chat`. Ollama cloud features should be disabled as described above.
-- **Telegram:** Telegram bot conversations are **not end-to-end encrypted**. Do not send sensitive secrets or private documents through this channel.
-- **Weather:** Open-Meteo receives the preset coordinates for Kanata when weather is requested, not the full conversation.
-- **Authorization:** Normal incoming text is processed only when its Telegram user ID matches `TELEGRAM_ALLOWED_USER_ID`. The `/id` setup command replies with the sender's own ID even before authorization.
-- **Tools:** The current code allowlists only `get_weather`; it does not provide shell execution or general filesystem access.
-- **Secrets:** Keep credentials in `.env`, never in source files, Git commits, screenshots, or issue reports. Rotate the bot token if it is exposed.
-- **Home network:** Telegram long polling does not require forwarding router ports. Keep Ollama bound to localhost.
-
-Before your first commit, verify:
+Run from the repository root:
 
 ```bash
-git status --short
-git check-ignore -v .env
+python3 -m unittest discover -v
 ```
 
-If `.env` was already committed, `.gitignore` alone will not remove it from Git history; remove the tracked secret and rotate the exposed credentials.
+The suite uses Python's built-in `unittest`. It does not read `.env`, need credentials or `python-dotenv`, or contact Telegram, Ollama, or Open-Meteo. Ollama can remain stopped. The suite also includes a mocked end-to-end weather flow.
+
+A successful run ends with `OK`. Some tests intentionally print safe failure events while exercising error handling; these do not indicate a failed test. Actual failures appear as `FAIL` or `ERROR` in the test results.
+
+For focused checks:
+
+```bash
+# Configuration and HTTP transport
+python3 -m unittest tests.test_config tests.test_http_client -v
+# Agent, tool validation, Ollama and weather responses
+python3 -m unittest tests.test_agent tests.test_services -v
+# Authorization, rate limits and polling
+python3 -m unittest tests.test_telegram -v
+# Mocked end-to-end flow and response safety
+python3 -m unittest tests.test_end_to_end -v
+# One regression test
+python3 -m unittest tests.test_telegram.BatchTimingTests.test_slow_first_request_does_not_expire_fresh_batch -v
+```
+
+## Manual live validation
+
+With Ollama and the assistant running, use your own configured Telegram account. These checks contact real services and are separate from the offline tests.
+
+Manual checklist:
+
+1. Send `/start`, a normal question, and a weather/umbrella question from the authorized private chat.
+2. Confirm JSON events show inference and weather execution without message contents or identifiers.
+3. Confirm `/id` returns an unknown-command response; no bootstrap bypass exists.
+4. Send an oversized message and a photo: expect safe text guidance.
+5. Send more than ten requests within a minute: excess requests are silently ignored. Commands and invalid inputs also consume the quota.
+6. If another account is available, confirm its messages and group messages receive no replies.
+7. Stop Ollama and send a question: expect a safe service error. Restart Ollama afterward.
+
+The automated suite exercises these failure paths without real credentials. Live compatibility and actual model answer quality require this manual check.
+
+## Privacy and limitations
+
+- Telegram bots are not end-to-end encrypted. Telegram receives conversations; Open-Meteo receives fixed coordinates. Local inference does not mean offline operation.
+- No shell or filesystem tools exist. Model tool requests pass through a fixed allowlist and argument validation.
+- Only approved private senders are processed.
+- Inference URLs require loopback IPs or `localhost` (normalized to `127.0.0.1`). The transport ignores proxy environment settings, does not follow redirects, verifies TLS, and caps JSON responses at 1 MB.
+- Ollama is a trusted local dependency: disable its cloud features. Model-name checks are defense in depth, not proof of local execution. This application does not configure or audit the Ollama server.
+- One request runs at a time. Telegram retains its own pending queue; this application processes bounded batches and skips messages already stale when their batch arrives. Slow processing does not expire later messages within that batch. Offsets are in memory, not durable. A crash can cause a recent update to replay; failed sends are not retried automatically.
+- Socket timeouts and between-operation budgets are not strict wall-clock cancellation. No memory or scheduler is implemented.
+- Logs contain event categories, controlled error codes, numeric HTTP statuses, and timings, never raw prompts, IDs, tokens, response bodies, or exception strings. They are console-only; event timing still reveals activity patterns.
 
 ## Troubleshooting
 
-| Symptom | What to check |
-| --- | --- |
-| `Missing TELEGRAM_BOT_TOKEN in .env` | Confirm `.env` is in the same directory as `assistant.py` and contains a token. |
-| `Missing TELEGRAM_ALLOWED_USER_ID in .env` | Set a nonzero numeric ID (use the temporary bootstrap value `1` if needed). |
-| Bot doesn't answer | Confirm `python assistant.py` is still running, you sent a private message, and your Telegram ID matches the allowlist. |
-| Ollama connection error | Open Ollama; confirm `curl http://127.0.0.1:11434/api/tags` works. |
-| Model not found | Run `ollama pull qwen3.5:4b`; check `OLLAMA_MODEL` in `.env`. |
-| Slow answer | The first response may load the model into memory. Keep other memory-intensive apps closed. |
-| Telegram polling error | Check internet access and the token. A bot can't use long polling while an incoming webhook is configured. |
-| Weather unavailable | Check internet connectivity and availability of the Open-Meteo API. |
-
-## Roadmap
-
-- [x] Initial local Ollama integration
-- [x] Telegram channel adapter
-- [x] First tool: today's weather forecast
-- [x] `.env`-based configuration
-- [ ] Refactor into independent `agent/`, `channels/`, and `tools/` modules
-- [ ] Unit tests and clearer error handling
-- [ ] Optional location parameter and hourly weather forecasts
-- [ ] Short-term conversation state and persistent local memory
-- [ ] Local scheduling / morning weather alerts
-- [ ] iMessage channel adapter
-- [ ] Dedicated always-on home server
-
-> The checked items indicate functionality in the **initial code**, not completed integration testing on every machine.
-
-## Useful links
-
-- [Ollama](https://ollama.com/) and [Qwen3.5 models](https://ollama.com/library/qwen3.5)
-- [Ollama cloud settings FAQ](https://github.com/ollama/ollama/blob/main/docs/faq.mdx#how-do-i-disable-ollama-cloud-features)
-- [Telegram Bot API](https://core.telegram.org/bots/api)
-- [Open-Meteo API](https://open-meteo.com/en/docs)
+| Symptom | Action |
+|---|---|
+| `startup_failed` | Check required settings, positive limits, timezone, local URL and dependency installation. Values are intentionally not printed. |
+| `No module named dotenv` | Activate `.venv`; run `python -m pip install -r requirements.txt`. The package is named `python-dotenv`. |
+| Settings seem ignored | Exported variables override `.env`; unset obsolete exports locally. |
+| Certificate verification fails on python.org Python 3.13 | Run `/Applications/Python 3.13/Install Certificates.command`, then retry. Never disable TLS verification. See [Python macOS setup](https://docs.python.org/3.13/using/mac.html). |
+| `poll_failed` | Check connectivity, token, certificates, webhook configuration, and that only one bot process runs. |
+| `inference_failed` | Check Ollama is running, the model is installed, and the inference timeout is sufficient. |
+| `tool_failed` | Check Open-Meteo connectivity; invalid/missing response fields fail safely. |
+| No reply | Check sender ID/private chat, rate limit, message age, and console events. |
+| Slow first reply | The model may need loading into memory. |
 
 ## License
 
-No license has been selected yet. Add a `LICENSE` file before publicly inviting reuse or contributions.
+No license has been selected.
